@@ -1,0 +1,1207 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import {
+  PenTool,
+  FileText,
+  Download,
+  Printer,
+  Sparkles,
+  BookOpen,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  Trash2,
+  CheckSquare,
+  Bookmark,
+  Share2,
+  Sliders,
+  Layers,
+  Palette,
+  Eye,
+  RotateCcw,
+  Plus,
+  Image as ImageIcon
+} from 'lucide-react';
+
+/* ==========================================================================
+   STRICT TYPES & DATA MODELS
+   ========================================================================== */
+
+export type HandwritingFont = 'casual' | 'architect' | 'journal';
+export type PaperTexture = 'ruled' | 'grid' | 'dotted' | 'legal-yellow';
+export type InkColor = 'gel-blue' | 'royal-blue' | 'black' | 'vintage-sepia' | 'crimson' | 'forest';
+export type HighlightTone = 'yellow' | 'green' | 'pink' | 'blue';
+export type NoteDensity = 'compact' | 'normal' | 'spacious';
+
+export interface StudioConfig {
+  font: HandwritingFont;
+  paper: PaperTexture;
+  ink: InkColor;
+  highlightTone: HighlightTone;
+  jitterLevel: number; // 0 to 6
+  slantAngle: number; // -12 to 22 deg
+  density: NoteDensity;
+  hasCreases: boolean;
+  zoom: number;
+}
+
+export interface StickyNoteItem {
+  id: string;
+  pageNumber: number;
+  text: string;
+}
+
+export interface ParsedLineToken {
+  type: 'heading' | 'text' | 'sketch' | 'sticky' | 'task';
+  raw: string;
+  checked?: boolean;
+}
+
+// Global media store to keep huge base64 strings completely out of the textarea
+type MediaStore = Record<string, string>;
+
+/* ==========================================================================
+   CONSTANTS & COLOR MAPS
+   ========================================================================== */
+
+const INK_PALETTES: Record<InkColor, { label: string; hex: string; cssVar: string }> = {
+  'gel-blue': { label: 'Gel Pen Blue', hex: '#0038a8', cssVar: '#0038a8' },
+  'royal-blue': { label: 'Royal Blue', hex: '#1a365d', cssVar: '#1a365d' },
+  'black': { label: 'Ballpoint Black', hex: '#171717', cssVar: '#171717' },
+  'vintage-sepia': { label: 'Vintage Sepia', hex: '#4a2c11', cssVar: '#4a2c11' },
+  'crimson': { label: 'Teacher Red', hex: '#991b1b', cssVar: '#991b1b' },
+  'forest': { label: 'Forest Green', hex: '#14532d', cssVar: '#14532d' },
+};
+
+const HIGHLIGHT_PALETTES: Record<HighlightTone, { label: string; bg: string }> = {
+  yellow: { label: 'Pastel Yellow', bg: 'rgba(254, 240, 138, 0.85)' },
+  green: { label: 'Pastel Green', bg: 'rgba(187, 247, 208, 0.85)' },
+  pink: { label: 'Soft Pink', bg: 'rgba(251, 207, 232, 0.85)' },
+  blue: { label: 'Sky Blue', bg: 'rgba(186, 230, 253, 0.85)' },
+};
+
+const DEFAULT_SAMPLE_NOTES = `# Physics: Ohm's Law & Circuit Analysis
+Ohm's law relates voltage, current and resistance in an electrical circuit:
+V = IR !
+Current rises with voltage -> when resistance remains constant.
+
+# Mathematical Relationships & Formulas
+★ Current relation: I = [frac: V / R]
+★ Electric Power: P = [frac: V^2 / R] = I^2 * R
+★ RMS Voltage: V_rms = [frac: V_peak / [sqrt: 2]]
+
+[sticky: Important for Midterm! Memorize standard units: Volt (V), Ampere (A), Ohm (Ω).]
+
+# Laboratory Observations & Tasks
+💡 Calibrate DC power supply between 0V and 12V.
+[box] Measure resistor network at 25°C ambient temperature.
+-> Warning: Thermal dissipation causes resistance drift at higher currents!
+-> Conclusion: Linear relationship holds cleanly for ideal ohmic conductors.`;
+
+// Seeded PRNG for deterministic jitter
+function createPrng(seed: number) {
+  let s = seed;
+  return () => {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+}
+
+/* ==========================================================================
+   APP COMPONENT
+   ========================================================================== */
+
+export default function App() {
+  const [config, setConfig] = useState<StudioConfig>(() => {
+    return {
+      font: 'casual',
+      paper: 'ruled',
+      ink: 'gel-blue',
+      highlightTone: 'yellow',
+      jitterLevel: 3,
+      slantAngle: 0,
+      density: 'normal',
+      hasCreases: true,
+      zoom: 1.0,
+    };
+  });
+
+  const [rawText, setRawText] = useState<string>(() => {
+    return localStorage.getItem('scribbly_react_text') || DEFAULT_SAMPLE_NOTES;
+  });
+
+  // Media store mapping ID -> Base64 Data URL
+  const [mediaStore, setMediaStore] = useState<MediaStore>(() => {
+    try {
+      const stored = localStorage.getItem('scribbly_media_store');
+      return stored ? JSON.parse(stored) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isSketchModalOpen, setIsSketchModalOpen] = useState<boolean>(false);
+
+  // References
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sketchPadRef = useRef<HTMLCanvasElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const isDrawingRef = useRef<boolean>(false);
+
+  // Sync text to local storage
+  useEffect(() => {
+    try {
+      localStorage.setItem('scribbly_react_text', rawText);
+    } catch {
+      // Local storage disabled or full
+    }
+  }, [rawText]);
+
+  // Sync media store to local storage
+  useEffect(() => {
+    try {
+      localStorage.setItem('scribbly_media_store', JSON.stringify(mediaStore));
+    } catch {
+      // Storage limits handled gracefully
+    }
+  }, [mediaStore]);
+
+  // Show transient toast
+  const triggerToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((cur) => (cur === msg ? null : cur));
+    }, 2500);
+  }, []);
+
+  // Quick text syntax insertion
+  const handleInsertSyntax = useCallback((prefix: string, suffix: string = '') => {
+    const el = textareaRef.current;
+    if (!el) {
+      setRawText((prev) => prev + prefix + suffix);
+      return;
+    }
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const current = el.value;
+    const selection = current.substring(start, end);
+    const updated = current.substring(0, start) + prefix + selection + suffix + current.substring(end);
+    setRawText(updated);
+
+    setTimeout(() => {
+      el.focus();
+      el.selectionStart = start + prefix.length;
+      el.selectionEnd = end + prefix.length;
+    }, 10);
+  }, []);
+
+  // Convert File/Blob to clean media entry instead of raw base64 in textarea
+  const insertImageFileAsBase64 = useCallback((file: File, customCaption?: string) => {
+    if (!file.type.startsWith('image/')) {
+      triggerToast('Only image files are supported');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result as string;
+      if (dataUrl) {
+        const id = 'img_' + Math.random().toString(36).substring(2, 9);
+        const caption = customCaption || file.name.replace(/\.[^/.]+$/, '').slice(0, 24) || 'Pasted Diagram';
+
+        // Store image data in media registry
+        setMediaStore((prev) => ({ ...prev, [id]: dataUrl }));
+
+        // Insert clean short tag into textarea
+        handleInsertSyntax(`\n[image: ${id} | Fig: ${caption}]\n`, '');
+        triggerToast(`Image inserted cleanly as [image: ${id}]!`);
+      }
+    };
+    reader.readAsDataURL(file);
+  }, [handleInsertSyntax, triggerToast]);
+
+  // Image Upload Handler (Offline DataURL)
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    insertImageFileAsBase64(file);
+    e.target.value = ''; // Reset input
+  };
+
+  // Direct Clipboard Paste (Ctrl+V / Cmd+V) Handler for Screenshots & Diagrams
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.indexOf('image') !== -1) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault(); // Stop raw base64 or binary data from polluting textarea
+          const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          insertImageFileAsBase64(file, `Screenshot ${timestamp}`);
+          return;
+        }
+      }
+    }
+  };
+
+  // Drag-and-Drop Image Handler into Textarea
+  const handleDrop = (e: React.DragEvent<HTMLTextAreaElement>) => {
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        if (files[i].type.startsWith('image/')) {
+          e.preventDefault();
+          insertImageFileAsBase64(files[i]);
+          break;
+        }
+      }
+    }
+  };
+
+  // Sketchpad drawing handlers
+  const handleStartSketch = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = sketchPadRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    isDrawingRef.current = true;
+    const rect = canvas.getBoundingClientRect();
+    ctx.beginPath();
+    ctx.moveTo(e.clientX - rect.left, e.clientY - rect.top);
+  };
+
+  const handleDrawSketch = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawingRef.current) return;
+    const canvas = sketchPadRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const rect = canvas.getBoundingClientRect();
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = INK_PALETTES[config.ink].hex;
+    ctx.lineTo(e.clientX - rect.left, e.clientY - rect.top);
+    ctx.stroke();
+  };
+
+  const handleEndSketch = () => {
+    isDrawingRef.current = false;
+  };
+
+  const handleClearSketch = () => {
+    const canvas = sketchPadRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  };
+
+  const handleInsertDoodleToNote = () => {
+    const canvas = sketchPadRef.current;
+    if (!canvas) return;
+    const dataUrl = canvas.toDataURL('image/png');
+    const id = 'sketch_' + Math.random().toString(36).substring(2, 9);
+
+    // Save to media store
+    setMediaStore((prev) => ({ ...prev, [id]: dataUrl }));
+
+    // Insert clean tag
+    handleInsertSyntax(`\n[sketch: ${id}]\n`, '');
+    handleClearSketch();
+    setIsSketchModalOpen(false);
+    triggerToast('Handwritten diagram inserted into notes!');
+  };
+
+  // Export to Native Print / PDF
+  const handlePrintPdf = () => {
+    triggerToast('Generating vector print view... Select "Save as PDF"');
+    setTimeout(() => {
+      window.print();
+    }, 200);
+  };
+
+  // Export to PNG Image via HTML5 Canvas
+  const handleExportPng = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    triggerToast('Rendering high-resolution Page 1 image...');
+
+    const width = 794;
+    const height = 1123;
+    canvas.width = width * 2;
+    canvas.height = height * 2;
+    ctx.scale(2, 2);
+
+    // Background paper tint
+    ctx.fillStyle = config.paper === 'legal-yellow' ? '#fef9c3' : '#fffdf7';
+    ctx.fillRect(0, 0, width, height);
+
+    // Ruled lines
+    if (config.paper === 'ruled' || config.paper === 'legal-yellow') {
+      ctx.strokeStyle = config.paper === 'legal-yellow' ? '#cbd5e1' : '#bae6fd';
+      ctx.lineWidth = 1;
+      for (let y = 84; y < height - 60; y += 32) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+
+      // Red margin
+      ctx.strokeStyle = '#f87171';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(64, 0);
+      ctx.lineTo(64, height);
+      ctx.stroke();
+    }
+
+    // Draw text lines
+    ctx.fillStyle = INK_PALETTES[config.ink].hex;
+    ctx.font = '22px "Caveat", "Segoe Print", cursive, sans-serif';
+
+    let yOffset = 80;
+    const lines = rawText.split('\n').slice(0, 28);
+
+    lines.forEach((line) => {
+      if (line.startsWith('# ')) {
+        ctx.font = 'bold 26px "Caveat", "Segoe Print", cursive, sans-serif';
+        ctx.fillText(line.substring(2), 76, yOffset);
+        ctx.font = '22px "Caveat", "Segoe Print", cursive, sans-serif';
+      } else {
+        const clean = line.replace(/==/g, '').replace(/\[frac:|\]|\[sqrt:/g, '');
+        ctx.fillText(clean, 76, yOffset);
+      }
+      yOffset += 32;
+    });
+
+    // Page footer indicator
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('- Page 1 -', width - 100, height - 28);
+
+    setTimeout(() => {
+      const link = document.createElement('a');
+      link.download = `scribbly-notebook-p1.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+      triggerToast('PNG snapshot downloaded!');
+    }, 200);
+  };
+
+  // Pagination calculation: distributes lines into distinct physical pages
+  const paginatedPages = useMemo(() => {
+    const lines = rawText.split('\n');
+    const maxLinesPerPage = config.density === 'compact' ? 32 : config.density === 'spacious' ? 24 : 28;
+    const pages: string[][] = [];
+    let currentBuffer: string[] = [];
+
+    lines.forEach((line) => {
+      let weight = 1;
+      if (line.startsWith('# ')) weight = 1.6;
+      else if (line.startsWith('[sketch:')) weight = 4.5;
+      else if (line.startsWith('[image:')) weight = 5.5;
+      else if (line.length > 70) weight = 2;
+
+      if (currentBuffer.length + weight > maxLinesPerPage) {
+        pages.push(currentBuffer);
+        currentBuffer = [];
+      }
+      currentBuffer.push(line);
+    });
+
+    if (currentBuffer.length > 0 || pages.length === 0) {
+      pages.push(currentBuffer);
+    }
+    return pages;
+  }, [rawText, config.density]);
+
+  return (
+    <div className="flex flex-col min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-amber-300 selection:text-slate-900">
+      {/* ==========================================
+          EXECUTIVE STUDIO HEADER
+          ========================================== */}
+      <header className="sticky top-0 z-50 flex items-center justify-between px-6 py-3.5 bg-slate-800/95 backdrop-blur border-b border-slate-700 shadow-md print:hidden">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 to-rose-500 flex items-center justify-center text-white shadow-md shadow-amber-500/20">
+            <PenTool className="w-5 h-5 stroke-[2.2]" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-extrabold text-lg tracking-tight text-white">Scribbly Notes</span>
+              <span className="text-xs font-semibold px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                TypeScript Studio
+              </span>
+            </div>
+            <div className="text-[11px] text-slate-400 font-medium">Offline Handwritten Document Engine</div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => imageInputRef.current?.click()}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition border border-slate-600 shadow-sm"
+            title="Upload an image from your device"
+          >
+            <ImageIcon className="w-3.5 h-3.5 text-sky-400" />
+            Add Image
+          </button>
+          <input
+            type="file"
+            ref={imageInputRef}
+            onChange={handleImageUpload}
+            accept="image/*"
+            className="hidden"
+          />
+
+          <button
+            onClick={() => setIsSketchModalOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition border border-slate-600 shadow-sm"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+            Draw Sketch
+          </button>
+
+          <button
+            onClick={() => {
+              setRawText(DEFAULT_SAMPLE_NOTES);
+              triggerToast('Demo study notes reloaded!');
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition border border-slate-600 shadow-sm"
+          >
+            <BookOpen className="w-3.5 h-3.5" />
+            Sample Notes
+          </button>
+
+          <button
+            onClick={handleExportPng}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition border border-slate-600 shadow-sm"
+          >
+            <Download className="w-3.5 h-3.5" />
+            Save Image
+          </button>
+
+          <button
+            onClick={handlePrintPdf}
+            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition border border-emerald-500 shadow-sm shadow-emerald-900/30"
+          >
+            <Printer className="w-3.5 h-3.5" />
+            Export Vector PDF
+          </button>
+        </div>
+      </header>
+
+      {/* ==========================================
+          MAIN DUAL PANE WORKSPACE
+          ========================================== */}
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-[460px_1fr] print:block overflow-hidden">
+        {/* LEFT COLUMN: RAW EDITOR & CONTROLS */}
+        <aside className="flex flex-col bg-slate-800/90 border-r border-slate-700 overflow-y-auto print:hidden">
+          {/* Section: Typography & Paper */}
+          <div className="p-4 border-b border-slate-700/80 space-y-3.5">
+            <div className="flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider">
+              <span className="flex items-center gap-1.5">
+                <Palette className="w-3.5 h-3.5 text-amber-400" /> Styles & Themes
+              </span>
+              <span className="text-sky-400 font-mono font-medium lowercase">
+                {paginatedPages.length} {paginatedPages.length === 1 ? 'page' : 'pages'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-[11px] font-semibold text-slate-300">Handwriting Script</label>
+                <select
+                  value={config.font}
+                  onChange={(e) => setConfig({ ...config, font: e.target.value as HandwritingFont })}
+                  className="w-full bg-slate-900 border border-slate-600 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-500"
+                >
+                  <option value="casual">1. Casual Cursive</option>
+                  <option value="architect">2. Architect Print</option>
+                  <option value="journal">3. Journal Flow</option>
+                </select>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[11px] font-semibold text-slate-300">Paper Pattern</label>
+                <select
+                  value={config.paper}
+                  onChange={(e) => setConfig({ ...config, paper: e.target.value as PaperTexture })}
+                  className="w-full bg-slate-900 border border-slate-600 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-500"
+                >
+                  <option value="ruled">Classic Ruled</option>
+                  <option value="grid">Engineering Grid</option>
+                  <option value="dotted">Bullet Dotted</option>
+                  <option value="legal-yellow">Legal Yellow Pad</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Inks & Highlighters */}
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-semibold text-slate-300">Ink Color</label>
+                <div className="flex items-center gap-1.5">
+                  {(Object.keys(INK_PALETTES) as InkColor[]).map((inkKey) => (
+                    <button
+                      key={inkKey}
+                      onClick={() => setConfig({ ...config, ink: inkKey })}
+                      title={INK_PALETTES[inkKey].label}
+                      style={{ backgroundColor: INK_PALETTES[inkKey].hex }}
+                      className={`w-6 h-6 rounded-full border-2 transition-transform ${
+                        config.ink === inkKey
+                          ? 'border-white scale-110 shadow-md shadow-black'
+                          : 'border-slate-600 hover:scale-105'
+                      }`}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-semibold text-slate-300">Highlighter (==text==)</label>
+                <div className="flex items-center gap-1.5">
+                  {(Object.keys(HIGHLIGHT_PALETTES) as HighlightTone[]).map((hlKey) => (
+                    <button
+                      key={hlKey}
+                      onClick={() => setConfig({ ...config, highlightTone: hlKey })}
+                      title={HIGHLIGHT_PALETTES[hlKey].label}
+                      style={{ backgroundColor: HIGHLIGHT_PALETTES[hlKey].bg }}
+                      className={`w-6 h-6 rounded border transition-transform ${
+                        config.highlightTone === hlKey
+                          ? 'ring-2 ring-white scale-110'
+                          : 'border-slate-600 hover:scale-105'
+                      }`}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Slant & Jitter Sliders */}
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px] font-semibold text-slate-300">
+                  <span>Natural Jitter</span>
+                  <span className="text-amber-400 font-mono">{config.jitterLevel}</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="6"
+                  step="1"
+                  value={config.jitterLevel}
+                  onChange={(e) => setConfig({ ...config, jitterLevel: parseInt(e.target.value, 10) })}
+                  className="w-full accent-amber-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px] font-semibold text-slate-300">
+                  <span>Script Slant</span>
+                  <span className="text-amber-400 font-mono">
+                    {config.slantAngle > 0 ? `+${config.slantAngle}` : config.slantAngle}°
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="-12"
+                  max="22"
+                  step="1"
+                  value={config.slantAngle}
+                  onChange={(e) => setConfig({ ...config, slantAngle: parseInt(e.target.value, 10) })}
+                  className="w-full accent-amber-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Section: Raw Textarea & Quick Syntax Chips */}
+          <div className="flex-1 p-4 flex flex-col space-y-2">
+            <div className="flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider">
+              <span>Note Editor</span>
+              <span className="text-[11px] text-amber-400/90 font-mono flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+                Ctrl+V to paste images
+              </span>
+            </div>
+
+            <div className="flex flex-wrap gap-1.5 py-1">
+              <button
+                onClick={() => handleInsertSyntax('# ', '')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-slate-300"
+              >
+                # Title
+              </button>
+              <button
+                onClick={() => imageInputRef.current?.click()}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-sky-300 flex items-center gap-1"
+              >
+                <ImageIcon className="w-3 h-3" /> Photo
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('==', '==')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-amber-300"
+              >
+                ==Highlight==
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('[frac: ', ' / 2]')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-sky-300"
+              >
+                ½ Fraction
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('[sqrt: ', ']')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-emerald-300"
+              >
+                √ Radical
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('[sticky: ', ']')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-yellow-300"
+              >
+                📌 Sticky
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('-> ', '')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-rose-300"
+              >
+                -&gt; Arrow
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('★ ', '')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-amber-300"
+              >
+                ★ Star
+              </button>
+              <button
+                onClick={() => handleInsertSyntax('[box] ', '')}
+                className="px-2 py-0.5 text-[11px] font-medium bg-slate-700 hover:bg-slate-600 rounded text-slate-300"
+              >
+                ☐ Box
+              </button>
+            </div>
+
+            <textarea
+              ref={textareaRef}
+              value={rawText}
+              onChange={(e) => setRawText(e.target.value)}
+              onPaste={handlePaste}
+              onDrop={handleDrop}
+              onDragOver={(e) => e.preventDefault()}
+              placeholder="Type your lecture notes, formulas, or copy-paste (Ctrl+V) diagrams & screenshots directly here..."
+              className="flex-1 w-full min-h-[340px] bg-slate-900 border border-slate-700 rounded-xl p-3.5 text-xs font-mono text-slate-200 leading-relaxed resize-none focus:outline-none focus:border-amber-500 shadow-inner"
+            />
+          </div>
+        </aside>
+
+        {/* RIGHT COLUMN: INTERACTIVE A4 LIVE NOTEBOOK */}
+        <section className="bg-slate-950/95 overflow-y-auto overflow-x-auto p-8 flex flex-col items-center relative print:p-0 print:bg-white">
+          {/* Zoom & View Controls */}
+          <div className="w-[794px] max-w-full flex items-center justify-between mb-4 text-xs text-slate-400 print:hidden">
+            <div className="font-medium">
+              Showing {paginatedPages.length} A4 Notebook {paginatedPages.length === 1 ? 'Sheet' : 'Sheets'}
+            </div>
+
+            <div className="flex items-center gap-1.5 bg-slate-800 border border-slate-700 rounded-lg p-1 shadow-sm">
+              <button
+                onClick={() => setConfig({ ...config, zoom: Math.max(0.4, config.zoom - 0.1) })}
+                className="w-6 h-6 rounded flex items-center justify-center hover:bg-slate-700 text-slate-300 font-bold"
+              >
+                -
+              </button>
+              <span className="w-12 text-center font-mono font-bold text-white text-[11px]">
+                {Math.round(config.zoom * 100)}%
+              </span>
+              <button
+                onClick={() => setConfig({ ...config, zoom: Math.min(1.3, config.zoom + 0.1) })}
+                className="w-6 h-6 rounded flex items-center justify-center hover:bg-slate-700 text-slate-300 font-bold"
+              >
+                +
+              </button>
+              <button
+                onClick={() => setConfig({ ...config, zoom: 1.0 })}
+                className="px-2 py-0.5 text-[10px] rounded hover:bg-slate-700 text-amber-400 font-semibold"
+              >
+                100%
+              </button>
+            </div>
+          </div>
+
+          {/* Multi-Page Sheet Container */}
+          <div
+            style={{ transform: `scale(${config.zoom})`, transformOrigin: 'top center' }}
+            className="flex flex-col gap-8 transition-transform duration-200 print:transform-none print:gap-0"
+          >
+            {paginatedPages.map((pageLines, pageIdx) => (
+              <NotebookPageRenderer
+                key={`page-${pageIdx}`}
+                pageIndex={pageIdx}
+                lines={pageLines}
+                config={config}
+                mediaStore={mediaStore}
+              />
+            ))}
+          </div>
+        </section>
+      </main>
+
+      {/* ==========================================
+          FREEHAND DIAGRAM SKETCH MODAL (FEATURE 1)
+          ========================================== */}
+      {isSketchModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-5 shadow-2xl max-w-lg w-full flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+              <div className="font-bold text-sm text-white flex items-center gap-2">
+                <PenTool className="w-4 h-4 text-amber-400" />
+                Draw Handwritten Sketch / Circuit
+              </div>
+              <button
+                onClick={() => setIsSketchModalOpen(false)}
+                className="text-slate-400 hover:text-white text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <canvas
+              ref={sketchPadRef}
+              width={440}
+              height={220}
+              onMouseDown={handleStartSketch}
+              onMouseMove={handleDrawSketch}
+              onMouseUp={handleEndSketch}
+              onMouseLeave={handleEndSketch}
+              className="bg-[#fffdf7] border-2 border-dashed border-slate-600 rounded-xl cursor-crosshair mx-auto shadow-inner"
+            />
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                onClick={handleClearSketch}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300"
+              >
+                Clear Canvas
+              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setIsSketchModalOpen(false)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleInsertDoodleToNote}
+                  className="px-3.5 py-1.5 text-xs font-bold rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-900"
+                >
+                  Insert Into Notes
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden canvas for high-dpi image exports */}
+      <canvas ref={canvasRef} className="hidden" />
+
+      {/* Transient Notification Toast */}
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 z-50 bg-slate-800 border-l-4 border-amber-500 text-white px-4 py-2.5 rounded-lg shadow-xl text-xs font-medium flex items-center gap-2">
+          <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Embedded Vector Styles for Standard A4 Printing & Font Fallbacks */}
+      <style>{`
+        @media print {
+          @page {
+            size: A4 portrait;
+            margin: 0;
+          }
+          body {
+            background: white !important;
+            color: black !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+/* ==========================================================================
+   INDIVIDUAL NOTEBOOK A4 SHEET COMPONENT
+   ========================================================================== */
+
+interface NotebookPageProps {
+  pageIndex: number;
+  lines: string[];
+  config: StudioConfig;
+  mediaStore: MediaStore;
+}
+
+const NotebookPageRenderer: React.FC<NotebookPageProps> = React.memo(({ pageIndex, lines, config, mediaStore }) => {
+  const prng = useMemo(() => createPrng(pageIndex * 1000 + 42), [pageIndex]);
+
+  // Paper pattern background styles
+  const getPaperBackgroundStyle = (): React.CSSProperties => {
+    switch (config.paper) {
+      case 'legal-yellow':
+        return {
+          backgroundColor: '#fef9c3',
+          backgroundImage: `
+            linear-gradient(90deg, transparent 61px, #f87171 61px, #f87171 62px, transparent 62px, transparent 65px, #f87171 65px, #f87171 66px, transparent 66px),
+            linear-gradient(to bottom, transparent 31px, #cbd5e1 31px, #cbd5e1 32px)
+          `,
+          backgroundSize: '100% 100%, 100% 32px',
+          backgroundPosition: '0 0, 0 54px',
+        };
+      case 'grid':
+        return {
+          backgroundColor: '#ffffff',
+          backgroundImage: `
+            linear-gradient(to right, #e2e8f0 1px, transparent 1px),
+            linear-gradient(to bottom, #e2e8f0 1px, transparent 1px)
+          `,
+          backgroundSize: '24px 24px',
+        };
+      case 'dotted':
+        return {
+          backgroundColor: '#fafaf9',
+          backgroundImage: `radial-gradient(#cbd5e1 1.5px, transparent 1.5px)`,
+          backgroundSize: '22px 22px',
+        };
+      case 'ruled':
+      default:
+        return {
+          backgroundColor: '#fffdf7',
+          backgroundImage: `
+            linear-gradient(90deg, transparent 63px, #fca5a5 63px, #fca5a5 65px, transparent 65px),
+            linear-gradient(to bottom, transparent 31px, #bae6fd 31px, #bae6fd 32px)
+          `,
+          backgroundSize: '100% 100%, 100% 32px',
+          backgroundPosition: '0 0, 0 54px',
+        };
+    }
+  };
+
+  // Font family stacks
+  const getFontFamily = () => {
+    switch (config.font) {
+      case 'architect':
+        return '"Architects Daughter", "Segoe Script", "Marker Felt", cursive';
+      case 'journal':
+        return '"Homemade Apple", "Brush Script MT", cursive';
+      case 'casual':
+      default:
+        return '"Caveat", "Segoe Print", "Bradley Hand", cursive';
+    }
+  };
+
+  return (
+    <div
+      style={{
+        ...getPaperBackgroundStyle(),
+        fontFamily: getFontFamily(),
+        color: INK_PALETTES[config.ink].hex,
+        width: '794px',
+        minWidth: '794px',
+        height: '1123px',
+        minHeight: '1123px',
+      }}
+      className="relative rounded-[2px] shadow-2xl p-[56px_44px_50px_76px] box-border select-text overflow-hidden print:shadow-none print:m-0 print:w-full print:h-screen print:break-after-page"
+    >
+      {/* Subtle paper binder holes */}
+      <div
+        className="absolute top-0 bottom-0 left-[18px] w-[14px] opacity-15 pointer-events-none"
+        style={{
+          backgroundImage: 'radial-gradient(circle, #334155 5px, transparent 6px)',
+          backgroundSize: '14px 180px',
+          backgroundPosition: 'center 90px',
+        }}
+      />
+
+      {/* Realistic paper crease gradient */}
+      {config.hasCreases && (
+        <div className="absolute inset-0 pointer-events-none bg-gradient-to-br from-white/30 via-transparent to-black/5" />
+      )}
+
+      {/* Lines flow container */}
+      <div className="flex flex-col relative z-10">
+        {lines.map((line, idx) => (
+          <NotebookLineItem
+            key={`line-${idx}`}
+            rawLine={line}
+            config={config}
+            rand={prng}
+            mediaStore={mediaStore}
+          />
+        ))}
+      </div>
+
+      {/* Page number footer */}
+      <div className="absolute bottom-[18px] right-[32px] text-xs text-slate-400 select-none font-sans font-medium">
+        - {pageIndex + 1} -
+      </div>
+    </div>
+  );
+});
+
+/* ==========================================================================
+   INDIVIDUAL LINE ITEM & TOKEN PARSER
+   ========================================================================== */
+
+interface NotebookLineProps {
+  rawLine: string;
+  config: StudioConfig;
+  rand: () => number;
+  mediaStore: MediaStore;
+}
+
+const NotebookLineItem: React.FC<NotebookLineProps> = React.memo(({ rawLine, config, rand, mediaStore }) => {
+  // Clean Image Tag Handler: [image: id_or_url | caption]
+  if (rawLine.startsWith('[image:') && rawLine.endsWith(']')) {
+    const rawContent = rawLine.slice(7, -1).trim();
+    const [imgRef, caption] = rawContent.split('|').map((s) => s.trim());
+    
+    // Resolve from mediaStore if it's an ID, or use direct if raw dataURL/URL
+    const imgSrc = mediaStore[imgRef] || imgRef;
+
+    return (
+      <div className="my-3 flex flex-col items-center justify-center relative select-none">
+        <div className="relative p-2 bg-white shadow-md border border-slate-200 rounded-sm transform -rotate-1 max-w-[420px]">
+          {/* Notebook washi tape effect on top of photo */}
+          <div className="absolute -top-2.5 left-1/2 -translate-x-1/2 w-20 h-5 bg-amber-200/80 backdrop-blur-[1px] rotate-1 shadow-sm border border-amber-300/60 rounded-[1px] pointer-events-none z-10" />
+
+          <img
+            src={imgSrc}
+            alt={caption || 'Notebook Attachment'}
+            className="max-h-[220px] max-w-full object-contain rounded-[1px] block"
+          />
+
+          {caption && (
+            <div className="mt-1.5 text-center text-xs font-serif italic text-slate-600 tracking-wide">
+              {caption}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Feature 1: Embedded Sketches [sketch: id_or_data]
+  if (rawLine.startsWith('[sketch:') && rawLine.endsWith(']')) {
+    const sketchRef = rawLine.slice(8, -1).trim();
+    const dataUrl = mediaStore[sketchRef] || sketchRef;
+
+    return (
+      <div className="my-2 ml-3">
+        <img
+          src={dataUrl}
+          alt="Handwritten Diagram"
+          className="max-w-[360px] max-h-[140px] block contrast-125 pointer-events-none"
+        />
+      </div>
+    );
+  }
+
+  // Feature 2: Yellow Pinned Sticky Notes
+  if (rawLine.startsWith('[sticky:') && rawLine.endsWith(']')) {
+    const text = rawLine.slice(8, -1).trim();
+    return (
+      <div className="absolute right-7 w-[170px] bg-[#fef08a] text-slate-900 shadow-md p-2.5 rounded-sm text-xs leading-snug rotate-2 border-t-8 border-amber-400/80 z-20 font-sans">
+        <strong>📌 Note:</strong>
+        <div className="mt-1 text-[11px]">{text}</div>
+      </div>
+    );
+  }
+
+  // Headings with wavy underline
+  if (rawLine.startsWith('# ')) {
+    return (
+      <div className="min-h-[32px] leading-[32px] text-[1.32em] font-bold underline decoration-wavy decoration-1.5 my-1">
+        <JitterTextRenderer text={rawLine.substring(2)} config={config} rand={rand} />
+      </div>
+    );
+  }
+
+  let formatted = rawLine;
+  let marginIcon: string | null = null;
+  let isCheckbox = false;
+
+  // Margin Doodle detection
+  if (formatted.startsWith('★ ')) {
+    marginIcon = '★';
+    formatted = formatted.substring(2);
+  } else if (formatted.startsWith('💡 ')) {
+    marginIcon = '💡';
+    formatted = formatted.substring(2);
+  }
+
+  // Checkbox or bullet prefix
+  if (formatted.startsWith('[box] ')) {
+    isCheckbox = true;
+    formatted = formatted.substring(6);
+  }
+
+  return (
+    <div className="min-h-[32px] leading-[32px] text-[22px] relative flex items-baseline">
+      {/* Margin Doodle in red ink */}
+      {marginIcon && (
+        <span className="absolute -left-9 text-rose-600 font-sans text-sm select-none">
+          {marginIcon}
+        </span>
+      )}
+
+      {/* Hand-drawn checkbox */}
+      {isCheckbox && (
+        <span className="mr-2 text-base select-none inline-block font-sans">
+          ☐
+        </span>
+      )}
+
+      {/* Rich inline tokens */}
+      <RichInlineTokenRenderer text={formatted} config={config} rand={rand} />
+    </div>
+  );
+});
+
+/* ==========================================================================
+   RICH INLINE TOKEN ENGINE (MATH FRACTIONS, SQUAREROOTS, HIGHLIGHTS, ARROWS)
+   ========================================================================== */
+
+interface TokenRendererProps {
+  text: string;
+  config: StudioConfig;
+  rand: () => number;
+}
+
+const RichInlineTokenRenderer: React.FC<TokenRendererProps> = ({ text, config, rand }) => {
+  const tokenRegex = /(\[frac:[^\]]+\]|\[sqrt:[^\]]+\]|==[^=]+==|->|=>)/g;
+  const parts = text.split(tokenRegex);
+
+  return (
+    <>
+      {parts.map((token, i) => {
+        if (!token) return null;
+
+        // Math Fractions: [frac: num / den]
+        if (token.startsWith('[frac:') && token.endsWith(']')) {
+          const expr = token.slice(6, -1).trim();
+          const [num, den] = expr.split('/');
+          return (
+            <span key={i} className="inline-flex flex-col text-center align-middle mx-1 text-[0.88em] leading-none">
+              <span className="border-b-[1.5px] border-current pb-[1px]">{num ? num.trim() : ''}</span>
+              <span className="pt-[2px]">{den ? den.trim() : ''}</span>
+            </span>
+          );
+        }
+
+        // Math Radicals: [sqrt: expr]
+        if (token.startsWith('[sqrt:') && token.endsWith(']')) {
+          const expr = token.slice(6, -1).trim();
+          return (
+            <span key={i} className="inline-flex items-center mx-1">
+              <span className="text-[1.25em] mr-[1px]">√</span>
+              <span className="border-t-[1.5px] border-current px-[3px]">{expr}</span>
+            </span>
+          );
+        }
+
+        // Multi-Color Highlights: ==highlight==
+        if (token.startsWith('==') && token.endsWith('==')) {
+          const content = token.slice(2, -2);
+          return (
+            <span
+              key={i}
+              style={{ backgroundColor: HIGHLIGHT_PALETTES[config.highlightTone].bg }}
+              className="px-1 rounded-sm mx-0.5 box-decoration-clone"
+            >
+              <JitterTextRenderer text={content} config={config} rand={rand} />
+            </span>
+          );
+        }
+
+        // Doodled Arrows: -> or =>
+        if (token === '->' || token === '=>') {
+          return (
+            <span key={i} className="text-rose-600 font-bold mx-1.5 inline-block">
+              ⟶
+            </span>
+          );
+        }
+
+        // Standard handwritten text with human jitter
+        return <JitterTextRenderer key={i} text={token} config={config} rand={rand} />;
+      })}
+    </>
+  );
+};
+
+/* ==========================================================================
+   HUMAN JITTER & SLANT WORD RENDERER
+   ========================================================================== */
+
+interface JitterRendererProps {
+  text: string;
+  config: StudioConfig;
+  rand: () => number;
+}
+
+const JitterTextRenderer: React.FC<JitterRendererProps> = ({ text, config, rand }) => {
+  const words = text.split(/(\s+)/);
+
+  return (
+    <>
+      {words.map((word, wIdx) => {
+        if (!word) return null;
+        if (/^\s+$/.test(word)) {
+          return <span key={wIdx}>{word}</span>;
+        }
+
+        let totalRot = config.slantAngle;
+        let yOffset = 0;
+        let scale = 1.0;
+        let opacity = 0.96;
+
+        if (config.jitterLevel > 0) {
+          const maxAngle = config.jitterLevel * 0.45;
+          const maxY = config.jitterLevel * 0.4;
+          const maxScale = 0.015 * config.jitterLevel;
+
+          totalRot += (rand() * 2 - 1) * maxAngle;
+          yOffset = (rand() * 2 - 1) * maxY;
+          scale = 1 + (rand() * 2 - 1) * maxScale;
+          opacity = 0.9 + rand() * 0.1;
+        }
+
+        const transformStyle = `translateY(${yOffset.toFixed(2)}px) rotate(${totalRot.toFixed(2)}deg) scale(${scale.toFixed(3)})`;
+
+        return (
+          <span
+            key={wIdx}
+            style={{
+              display: 'inline-block',
+              whiteSpace: 'pre',
+              transform: transformStyle,
+              opacity: opacity.toFixed(2),
+              transformOrigin: 'bottom center',
+              transition: 'transform 0.1s ease',
+            }}
+          >
+            {word}
+          </span>
+        );
+      })}
+    </>
+  );
+};
